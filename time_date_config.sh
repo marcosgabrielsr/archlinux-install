@@ -1,3 +1,5 @@
+TIMEZONE="America/Campo_Grande"     # fuso horário
+
 set_timezone() {
     ln -sf /usr/share/zoneinfo/$TIMEZONE
 }

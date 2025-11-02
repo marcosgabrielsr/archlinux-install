@@ -1,266 +1,209 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-IFS=$'\n\t'
+#!/bin/bash
 
-# ========== Utilidades/erros ==========
-log() { echo "[$(date +%T)] $*"; }
-err() { echo "[$(date +%T)] ERRO: $*" >&2; }
-die() { err "$@"; exit 1; }
-trap 'err "Falha na linha $LINENO"; exit 1' ERR
+# Importando arquivos com funções
+source config_services.sh
+source time_date_config.sh
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $1"; }
+set -e # faz o script parar se houver erro
 
-confirm() {
-  local q="${1:-Confirmar?} [s/N] "
-  read -r -p "$q" ans || true
-  [[ "${ans,,}" == "s" || "${ans,,}" == "y" ]]
+# --- VARIÁVEIS PRINCIPAIS ---
+DISK="/dev/nvme0n1"                 # disco onde instalar
+HOSTNAME="archlinux"
+USERNAME="mgs"
+PASSWORD="mgs1562"
+LOCALE="pt_BR.UTF-8"
+KEYMAP="br-abnt2"
+EFI_PART_SIZE="512MiB"              # tamanho da partição EFI
+SWAP_SIZE="2G"                      # tamanho da partição SWAP
+
+# Pacotes base
+BASE_PACKAGES="base base-devel linux linux-headers linux-firmware"
+
+# Pacotes adicionais
+EXTRA_PACKAGES="nano nvim"
+
+# Pacotes finais
+FINAL_PACKAGES="dosfstools mtools networkmanager iwd grub efibootmgr amd-ucode"
+
+# --- FUNÇÕES AUXILIARES ---
+msg() {
+    echo -e "\n==> $*\n"
 }
 
-# ========== Parâmetros (podem ser sobrescritos por env ou flags) ==========
-DISK="${DISK:-/dev/nvme0n1}"          # Disco de destino (ex.: /dev/nvme0n1, /dev/sda)
-HOSTNAME="${HOSTNAME:-archlinux}"
-USERNAME="${USERNAME:-mgs}"
-PASSWORD="${PASSWORD:-}"               # Recomenda-se passar via env: PASSWORD='...' ./install.sh
-LOCALE="${LOCALE:-pt_BR.UTF-8}"
-KEYMAP="${KEYMAP:-br-abnt2}"
-TIMEZONE="${TIMEZONE:-America/Campo_Grande}"
-SHELL_BIN="${SHELL_BIN:-/bin/bash}"
-SET_WHEEL_SUDO="${SET_WHEEL_SUDO:-1}"
-SKIP_CONFIRM="${SKIP_CONFIRM:-0}"
+# --- INÍCIO ---
+msg "Iniciando instação automatizada do Arch Linux"
 
-# Pacotes base (mantém sua chamada usando variáveis)
-BASE_PACKAGES="${BASE_PACKAGES:-linux linux-firmware sudo networkmanager iwd grub efibootmgr base-devel vim reflector}"
-EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
-
-usage() {
-  cat <<EOF
-Uso: $(basename "$0") [--yes]
-
-Variáveis aceitáveis via ENV:
-  DISK=/dev/nvme0n1 | /dev/sda
-  HOSTNAME=archlinux
-  USERNAME=mgs
-  PASSWORD=...
-  LOCALE=pt_BR.UTF-8
-  KEYMAP=br-abnt2
-  TIMEZONE=America/Campo_Grande
-  SHELL_BIN=/bin/bash
-  SET_WHEEL_SUDO=1|0
-  BASE_PACKAGES="..."   (padrão já inclui grub, efibootmgr, networkmanager, iwd, etc.)
-  EXTRA_PACKAGES="..."  (opcionais)
-  SKIP_CONFIRM=1        (pular confirmação destrutiva)
-
-Exemplos:
-  PASSWORD='minha-senha' TIMEZONE='America/Sao_Paulo' ./install.sh
-  DISK=/dev/sda SKIP_CONFIRM=1 ./install.sh --yes
-EOF
-}
-
-# Flags simples
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage; exit 0
-fi
-if [[ "${1:-}" == "--yes" ]]; then
-  SKIP_CONFIRM=1
+# Verifica se rodando como root (na live)
+if [[ $EUID -ne 0 ]]; then
+    echo "Este script precisa ser executado como root."
+    exit 1
 fi
 
-# ========== Pré-checagens ==========
-[[ $EUID -eq 0 ]] || die "Precisa rodar como root."
-[[ -f /etc/arch-release ]] || die "Este script é para Arch Linux (ambiente live ou chroot)."
-require_cmd parted
-require_cmd mkfs.fat
-require_cmd mkfs.ext4
-require_cmd mount
-require_cmd pacstrap
-require_cmd genfstab
-require_cmd arch-chroot
-require_cmd grub-install
-require_cmd grub-mkconfig
-require_cmd visudo
+# --- PARTIÇÕES ---
+msg "Iniciando partições do disco $DISK"
 
-# Internet mínima (opcional, mas recomendada)
-if ! ping -c1 -W1 archlinux.org >/dev/null 2>&1; then
-  log "Aviso: sem conectividade com archlinux.org; pacotes podem falhar."
-fi
+# Construindo tabela de partições
+parted --script $DISK \
+    mklabel gpt \
+    mkpart EFI fat32 1MiB 513MiB \
+    set 1 esp on \
+    mkpart root ext4 513MiB 50.5GiB \
+    mkpart home ext4 50.5GiB 100%
 
-# Evita travas do pacman
-if fuser /var/lib/pacman/db.lck >/dev/null 2>&1; then
-  die "pacman está em uso (db.lck). Tente novamente."
-fi
+# Verificando esquema de partições
+parted $DISK print
 
-# Sufixo de partição (nvme/mmc usam 'p', sata/virtio não)
-part_suf() {
-  local d="$1"
-  if [[ "$d" =~ (nvme|mmcblk) ]]; then
-    echo "p"
-  else
-    echo ""
-  fi
-}
+EFI="${DISK}p1"
+ROOT="${DISK}p2"
+HOME="${DISK}p3"
 
-P="$(part_suf "$DISK")"
-EFI="${DISK}${P}1"
-ROOT="${DISK}${P}2"
-HOME="${DISK}${P}3"
+# Formatando partições
+mkfs.fat -F32 $EFI
+mkfs.ext4 -F  $ROOT
+mkfs.ext4 -F  $HOME
 
-# ========== Particionamento (DESTRUTIVO) ==========
-log "Disco alvo: $DISK"
-lsblk -o NAME,SIZE,TYPE,MOUNTPOINT | sed 's/^/  /'
-if [[ "$SKIP_CONFIRM" != "1" ]]; then
-  echo
-  echo "⚠️  Isto vai APAGAR COMPLETAMENTE o conteúdo de $DISK:"
-  echo "  - GPT nova"
-  echo "  - Partição 1 (EFI):    1MiB–513MiB (FAT32, 'esp on')"
-  echo "  - Partição 2 (root):   513MiB–50.5GiB (ext4)"
-  echo "  - Partição 3 (home):   50.5GiB–100% (ext4)"
-  confirm "Deseja prosseguir?" || die "Cancelado pelo usuário."
-fi
+# Montando partições
+mount $ROOT /mnt
+mkdir -p /mnt/{boot/efi,home}
+mount $EFI /mnt/boot/efi
+mount $HOME /mnt/home
 
-log "Criando tabela GPT e partições…"
-# Desmonta algo pendurado
-umount -R /mnt >/dev/null 2>&1 || true
-swapoff -a >/dev/null 2>&1 || true
+msg "Partições montadas com sucesso!"
 
-# Zera assinaturas e cria GPT limpa
-wipefs -af "$DISK" || true
-parted --script "$DISK" \
-  mklabel gpt \
-  mkpart "EFI system partition" fat32 1MiB 513MiB \
-  set 1 esp on \
-  mkpart "root partition" ext4 513MiB 50.5GiB \
-  mkpart "home partition" ext4 50.5GiB 100%
+# --- MIRRORLIST ---
+msg "Atualizando mirrorlist"
 
-partprobe "$DISK" || true
-sleep 1
+msg "Instalando reflector"
+pacman -Syu --noconfirm
+pacman -S --noconfirm reflector
 
-log "Partições criadas:"
-lsblk -o NAME,SIZE,TYPE,PARTLABEL,MOUNTPOINT "$DISK" | sed 's/^/  /'
+# Parametros do reflector
+COUNTRY="Brazil,Argentina,Chile"
+LATEST="20"
+SORT="rate"
+PATH_SAVE="/etc/pacman.d/mirrorlist"
 
-# ========== Formatação ==========
-log "Formatando sistemas de arquivos…"
-mkfs.fat -F32 "$EFI"
-mkfs.ext4 -F "$ROOT"
-mkfs.ext4 -F "$HOME"
+reflector --country $COUNTRY --latest $LATEST --sort $SORT --save $PATH_SAVE
+MIRROR="Server = https://mirror.osbeck.com/archlinux/\$repo/os/\$arch"
+sed -i "1i $MIRROR" /etc/pacman.d/mirrorlist
 
-# ========== Montagem ==========
-log "Montando partições…"
-mount "$ROOT" /mnt
-install -d /mnt/boot/efi /mnt/home
-mount "$EFI" /mnt/boot/efi
-mount "$HOME" /mnt/home
+pacman -Syu --noconfirm
 
-log "Layout montado:"
-lsblk -o NAME,SIZE,TYPE,MOUNTPOINT | sed 's/^/  /'
+msg "Mirrorlist atualizada com sucesso!"
 
-# ========== Instalação base ==========
-log "Instalando sistema base com pacstrap…"
-# Mantém seu padrão (base + variáveis)
-pacstrap -K /mnt base ${BASE_PACKAGES} ${EXTRA_PACKAGES} --noconfirm
+# --- INSTALANDO BASE DO SISTEMA ---
+msg "Instalando pacotes:
+ - Pacotes Base: $BASE_PACKAGES
+- Pacotes extras: $EXTRA_PACKAGES"
 
-# ========== Fstab ==========
-log "Gerando fstab…"
+pacstrap -K /mnt base $BASE_PACKAGES $EXTRA_PACKAGES --noconfirm
+
+msg "Pacotes instalados com sucesso!"
+
+# --- CONFIGURANDO O FSTAB ---
+msg "Gerando arquivo fstab"
+
 genfstab -U /mnt >> /mnt/etc/fstab
-log "fstab gerado em /mnt/etc/fstab"
 
-# ========== Configuração no chroot ==========
-log "Entrando no sistema (arch-chroot) para configurar…"
+msg "fstab gerado com sucesso!"
 
-arch-chroot /mnt /bin/bash -e <<CHROOT
-set -Eeuo pipefail
-IFS=\$'\n\t'
-log(){ echo "[\$(date +%T)] [chroot] \$*"; }
-err(){ echo "[\$(date +%T)] [chroot] ERRO: \$*" >&2; }
-trap 'err "Falha na linha \$LINENO"; exit 1' ERR
+# --- ENTRANDO NO SISTEMA ---
+msg "Acessando sistema local"
 
-# Locale
-if ! grep -q "^${LOCALE} UTF-8" /etc/locale.gen; then
-  sed -i "s/^#\s*${LOCALE}\s\+UTF-8/${LOCALE} UTF-8/" /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
-fi
-locale-gen
-echo "LANG=${LOCALE}" > /etc/locale.conf
+arch-chroot
 
-# Keymap
-echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
+msg "Sistema acessado com sucesso!"
 
-# Timezone, NTP e relógio
-ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
-timedatectl set-timezone "${TIMEZONE}" || true
-timedatectl set-ntp true || true
-hwclock --systohc --utc || true
+# --- EDITANDO PACMAN.CONF ---
+msg "Configurando pacman.conf"
 
-# Hostname e hosts
-echo "${HOSTNAME}" > /etc/hostname
-cat >/etc/hosts <<EOF_H
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
-EOF_H
-
-# Pacman: habilita paralelismo leve, colore
-if grep -q '^#ParallelDownloads' /etc/pacman.conf; then
-  sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
-fi
+# Habilitar cores
 sed -i 's/^#Color/Color/' /etc/pacman.conf
 
-# Mirrorlist com reflector (se instalado)
-if command -v reflector >/dev/null 2>&1; then
-  reflector --country "Brazil,Argentina,Chile" --latest 20 --sort rate --save /etc/pacman.d/mirrorlist || true
+# Habilitar downloads paralelos (exemplo: 5)
+if grep -q '^#ParallelDownloads' /etc/pacman.conf; then
+    sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+elif ! grep -q '^ParallelDownloads' /etc/pacman.conf; then
+    echo "ParallelDownloads = 5" >> /etc/pacman.conf
 fi
 
-# Sudoers (grupo wheel)
-if [[ "${SET_WHEEL_SUDO}" == "1" ]]; then
-  tmp=\$(mktemp)
-  echo "%wheel ALL=(ALL:ALL) ALL" > "\$tmp"
-  visudo -cf "\$tmp"
-  install -Dm440 "\$tmp" /etc/sudoers.d/00-wheel
-  rm -f "\$tmp"
-fi
+msg "pacman.conf atualizado com sucesso!"
 
-# Usuário
-if ! id -u "${USERNAME}" >/dev/null 2>&1; then
-  useradd -m -G wheel -s "${SHELL_BIN}" "${USERNAME}"
-fi
-# senha será definida depois (fora do chroot) para evitar eco em logs
+# --- DEFININDO FUSO HORÁRIO E RELOGIO ---
+msg "Configurando fuso horario e relogio"
+set_timezone
+synchronize_clock
+synchronize_internet_clock
+msg "fuso horario e relogios configurados com sucesso!"
 
-# NetworkManager + backend iwd (drop-in idempotente)
-install -d /etc/NetworkManager/conf.d
-cat > /etc/NetworkManager/conf.d/10-iwd.conf <<'EOF_NM'
-[device]
-wifi.backend=iwd
-EOF_NM
-systemctl disable --now iwd.service >/dev/null 2>&1 || true
-systemctl disable --now wpa_supplicant.service >/dev/null 2>&1 || true
-systemctl enable NetworkManager.service
+# --- CONFIGURANDO LINGUAGENS ---
+msg "Configurando idiomas"
 
-# Bootloader: GRUB UEFI em /boot/efi
+# Habilitar en_US.UTF-8 e pt_BR.UTF-8
+sed -i 's/^#en_US\.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' "/etc/locale.gen"
+sed -i 's/^#pt_BR\.UTF-8 UTF-8/pt_BR.UTF-8 UTF-8/' "/etc/locale.gen"
+
+locale-gen
+
+# Definir o idioma principal (en_US)
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+# Opcional: adicionar variável para português secundário
+echo "LC_MESSAGES=pt_BR.UTF-8" >> /etc/locale.conf
+msg "Idiomas configurados com sucesso!"
+
+# --- CONFIGURANDO LAYOUT DO TECLADO ---
+msg "Configurando layout do teclado"
+echo "KEYMAP=br-abnt2" >> /etc/vconsole.conf
+msg "layout configurado com sucesso!"
+
+# --- CONFIGURANDO HOSTNAME ---
+msg "Configurando hostname"
+echo "$HOSTNAME" >> /etc/hostname
+msg "Hostname configurando com sucesso!"
+
+# --- CONFIGURANDO HOSTS ---
+msg "Configurando arquivo /etc/hosts/"
+
+echo "127.0.0.1         localhost" >> /etc/hosts
+echo "::1               localhost" >> /etc/hosts
+echo "127.0.1.1         $HOSTNAME.localdomain   $HOSTNAME" >> /etc/hosts
+
+msg "Configuracao do arquivo /etc/hosts/ concluida com sucesso"
+
+# --- CONFIGURANDO SENHA DO ROOT ---
+echo "Configurando senha do adm"
+passwd
+echo "Senha configurada com sucesso!"
+
+# --- CRIANDO USUÁRIO COMUM ---
+msg "Criando usuario"
+# Ativando grupo wheel
+msg "Ativando grupo wheel no diretorio /etc/sudoers"
+
+# Descomenta a linha do grupo wheel no sudoers
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+msg "Grupo wheel ativado com sucesso!"
+
+useradd -mG wheel $USERNAME
+passwd $USERNAME
+
+# --- INSTALANDO PACOTES FINAIS ---
+msg "Instalando pacotes da etapa final"
+msg "Instalando: $FINAL_PACKAGES"
+pacman -S $FINAL_PACKAGES
+msg "Pacotes instalados com sucesso!"
+
+# --- CONFIGURANDO GRUB ---
+msg "Configurando grub"
+msg "Instalando grub"
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=archlinux --recheck
+msg "grub instalado com sucesso!"
 grub-mkconfig -o /boot/grub/grub.cfg
+msg "grub configurado com sucesso!"
 
-log "Configuração no chroot finalizada."
-CHROOT
+# --- HABILITANDO NETWORK MANAGER ---
+msg "Configurando pacotes de internet"
+enable_internet_service
+setting_iwd_on_networkmanager
+msg "pacotes configurados com sucesso!"
 
-# Define senha do usuário (fora do chroot para não vazar echo)
-if [[ -z "${PASSWORD}" ]]; then
-  echo "Digite a senha para ${USERNAME}:"
-  read -r -s pass1
-  echo "Confirme a senha:"
-  read -r -s pass2
-  [[ "\$pass1" == "\$pass2" ]] || die "Senhas não conferem."
-  PASSWORD="\$pass1"
-fi
-echo "${USERNAME}:${PASSWORD}" | arch-chroot /mnt chpasswd
-
-log "Instalação concluída 🎉"
-echo
-echo "Resumo:"
-echo "  Disco        : $DISK"
-echo "  Partições    : $EFI (EFI), $ROOT (root), $HOME (home)"
-echo "  Hostname     : $HOSTNAME"
-echo "  Usuário      : $USERNAME (wheel=${SET_WHEEL_SUDO})"
-echo "  Locale       : $LOCALE"
-echo "  Keymap       : $KEYMAP"
-echo "  Timezone     : $TIMEZONE"
-echo
-echo "Próximos passos:"
-echo "  - Reinicie, conecte-se ao Wi-Fi com 'nmtui' ou 'nmcli' se necessário."
-echo "  - Após boot, considere instalar microcódigo (intel-ucode/amd-ucode) e drivers gráficos."
